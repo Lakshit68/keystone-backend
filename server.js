@@ -20,6 +20,26 @@ mongoose.connect(process.env.MONGODB_URI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
 });
+const db = mongoose.connection;
+db.on('error', console.error.bind(console, 'MongoDB connection error:'));
+db.once('open', () => {
+    console.log('Connected to MongoDB');
+    // Seed initial admin if none exists
+    (async () => {
+        try {
+            const existingCount = await AdminUser.countDocuments();
+            if (existingCount === 0) {
+                const defaultUsername = process.env.ADMIN_USERNAME || 'keystone';
+                const defaultPassword = process.env.ADMIN_PASSWORD || 'keystone123';
+                const passwordHash = await bcrypt.hash(defaultPassword, 10);
+                await AdminUser.create({ username: defaultUsername, passwordHash });
+                console.log(`Initialized admin user: ${defaultUsername}`);
+            }
+        } catch (e) {
+            console.error('Error seeding admin user:', e.message);
+        }
+    })();
+});
 
 
 
