@@ -6,6 +6,7 @@ const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -14,6 +15,13 @@ const PORT = process.env.PORT || 5001;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Cloudinary configuration
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 // MongoDB connection
 mongoose.connect(process.env.MONGODB_URI);
@@ -45,58 +53,26 @@ const blogSchema = new mongoose.Schema({
     title: { type: String, required: true },
     description: { type: String, required: true },
     content: { type: String, required: true },
-    image: {
-        type: Buffer,
-        required: true,
-        set: (value) => {
-            if (typeof value === "string") {
-                const rawBase64 = value.toString("utf-8").replace(/data:\w+\/\w+;base64,/, "").toString("base64")
-                return Buffer.from(rawBase64, 'base64')
-            }
-            return value
-        }
-    },
+    imageUrl: { type: String, required: true },
+    imagePublicId: { type: String },
     author: { type: String, default: 'Admin' },
     publishedAt: { type: Date, default: Date.now },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
 });
-blogSchema.set('toJSON', {
-    transform: (doc, ret) => {
-        ret.image = ("data:image/webp;base64," + doc.image.toString('utf-8')).toString("base64")
-        return ret
-    }
-})
 
 const gallerySchema = new mongoose.Schema({
     title: { type: String, required: true },
     description: { type: String },
     images: [{
-        data: {
-            type: Buffer, required: true, set: (value) => {
-                if (typeof value === "string") {
-                    const rawBase64 = value.toString("utf-8").replace(/data:\w+\/\w+;base64,/, "").toString("base64")
-                    console.log(rawBase64.toString("utf-8").slice(0, 20))
-                    return Buffer.from(rawBase64, 'base64')
-                }
-                return value
-            }
-        },
+        url: { type: String, required: true },
+        publicId: { type: String },
         contentType: { type: String, required: true },
     }],
     publishedAt: { type: Date, default: Date.now },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
 });
-gallerySchema.set('toJSON', {
-    transform: (doc, ret) => {
-        ret.images = doc.images.map((image) => ({
-            data: ("data:image/webp;base64," + image.data.toString('utf-8')).toString("base64"),
-            contentType: image.contentType
-        }))
-        return ret
-    }
-})
 
 const resourceSchema = new mongoose.Schema({
     title: { type: String, required: true },
@@ -127,6 +103,15 @@ const AdminUser = mongoose.model('AdminUser', adminUserSchema);
 
 // Routes
 
+// Helper to upload a base64 or data URI image to Cloudinary
+async function uploadImageToCloudinary(dataUri, folder) {
+    const res = await cloudinary.uploader.upload(dataUri, {
+        folder,
+        resource_type: 'image',
+    });
+    return { url: res.secure_url, publicId: res.public_id, format: res.format };
+}
+
 // Blog routes
 app.get('/api/blogs', async (req, res) => {
     try {
@@ -150,11 +135,19 @@ app.get('/api/blogs/:id', async (req, res) => {
 app.post('/api/blogs', async (req, res) => {
     try {
         const { title, description, content, image, author } = req.body;
+
+        if (!image) {
+            return res.status(400).json({ error: 'Image is required' });
+        }
+
+        const { url, publicId } = await uploadImageToCloudinary(image, 'blogs');
+
         const blog = await Blog.create({
             title,
             description,
             content,
-            image,
+            imageUrl: url,
+            imagePublicId: publicId,
             author
         });
         await blog.save();
@@ -169,8 +162,11 @@ app.put('/api/blogs/:id', async (req, res) => {
         const { title, description, content, image, author } = req.body;
         const updateData = { title, description, content, author, updatedAt: new Date() };
 
-        if (image) {
-            updateData.image = image;
+        // Only upload new image if provided and it's a data URI (not existing URL)
+        if (image && image.startsWith('data:')) {
+            const { url, publicId } = await uploadImageToCloudinary(image, 'blogs');
+            updateData.imageUrl = url;
+            updateData.imagePublicId = publicId;
         }
 
         const blog = await Blog.findByIdAndUpdate(req.params.id, updateData, { new: true });
@@ -214,13 +210,21 @@ app.get('/api/galleries/:id', async (req, res) => {
 app.post('/api/galleries', async (req, res) => {
     try {
         const { title, description, images } = req.body;
+        if (!Array.isArray(images) || images.length === 0) {
+            return res.status(400).json({ error: 'At least one image is required' });
+        }
+
+        const uploaded = await Promise.all(
+            images.map(async (img) => {
+                const { url, publicId } = await uploadImageToCloudinary(img.data || img, 'galleries');
+                return { url, publicId, contentType: img.contentType || 'image/jpeg' };
+            })
+        );
+
         const gallery = new Gallery({
             title,
             description,
-            images: images.map(img => ({
-                data: img.data,
-                contentType: img.contentType
-            }))
+            images: uploaded
         });
         await gallery.save();
         res.json(gallery);
@@ -234,8 +238,22 @@ app.put('/api/galleries/:id', async (req, res) => {
         const { title, description, images } = req.body;
         const updateData = { title, description, updatedAt: new Date() };
 
-        if (images) {
-            updateData.images = images;
+        if (Array.isArray(images)) {
+            const uploaded = await Promise.all(
+                images.map(async (img) => {
+                    // If the client sent an existing URL, keep it; otherwise upload
+                    if (typeof img === 'string' && img.startsWith('http')) {
+                        return { url: img, contentType: 'image/jpeg' };
+                    }
+                    if (img?.data && img.data.startsWith('http')) {
+                        return { url: img.data, contentType: img.contentType || 'image/jpeg' };
+                    }
+                    const source = img?.data || img;
+                    const { url, publicId } = await uploadImageToCloudinary(source, 'galleries');
+                    return { url, publicId, contentType: img.contentType || 'image/jpeg' };
+                })
+            );
+            updateData.images = uploaded;
         }
 
         const gallery = await Gallery.findByIdAndUpdate(req.params.id, updateData, { new: true });
@@ -398,35 +416,7 @@ const requireAuth = (req, res, next) => {
     }
 };
 
-// Image serving routes
-app.get('/api/images/blog/:id', async (req, res) => {
-    try {
-        const blog = await Blog.findById(req.params.id);
-        if (!blog) return res.status(404).json({ error: 'Blog not found' });
-
-        res.set('Content-Type', blog.imageType);
-        res.send(blog.image);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.get('/api/images/gallery/:id/:imageIndex', async (req, res) => {
-    try {
-        const gallery = await Gallery.findById(req.params.id);
-        console.log(req.params.id, req.params.imageIndex)
-        if (!gallery) return res.status(404).json({ error: 'Gallery not found' });
-
-        const imageIndex = parseInt(req.params.imageIndex);
-        if (imageIndex >= gallery.images.length) return res.status(404).json({ error: 'Image not found' });
-
-        const image = gallery.images[imageIndex];
-        res.set('Content-Type', image.contentType);
-        res.send(image.data);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
+// Image routes are no longer required when using Cloudinary URLs
 
 app.get('/api/images/resource/:id', async (req, res) => {
     try {
